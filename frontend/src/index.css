@@ -1,0 +1,48 @@
+@import "tailwindcss";
+
+@theme {
+  --font-sans: 'Plus Jakarta Sans', 'Inter', system-ui, -apple-system, sans-serif;
+
+  --color-cream-50: #0f1117; /* App background */
+  --color-cream-100: #1a1d27; /* Card background / inputs */
+  --color-cream-200: #2d3342; /* Borders */
+
+  --color-gold-300: #60a5fa;
+  --color-gold-400: #3b82f6; /* Accent background */
+  --color-gold-500: #2563eb; /* Primary button */
+  --color-gold-600: #1d4ed8;
+
+  --color-ink-900: #ffffff; /* Primary text */
+  --color-ink-700: #f3f4f6;
+  --color-ink-500: #9ca3af; /* Secondary text */
+  --color-ink-300: #4b5563;
+
+}
+
+html, body, #root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  font-family: var(--font-sans);
+  background: var(--color-cream-50);
+  background-image: radial-gradient(circle at top right, #1e293b, transparent 400px), 
+                    radial-gradient(circle at bottom left, #172554, transparent 400px);
+  color: var(--color-ink-900);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Hide webkit scrollbars inside scan cards for a cleaner look */
+.scrollbar-none::-webkit-scrollbar { display: none; }
+
+/* Override webkit autofill to maintain dark theme */
+input:-webkit-autofill,
+input:-webkit-autofill:hover, 
+input:-webkit-autofill:focus, 
+input:-webkit-autofill:active{
+    -webkit-box-shadow: 0 0 0 30px var(--color-cream-100) inset !important;
+    -webkit-text-fill-color: var(--color-ink-900) !important;
+    transition: background-color 5000s ease-in-out 0s;
+}

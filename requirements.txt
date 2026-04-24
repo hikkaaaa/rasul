@@ -1,0 +1,28 @@
+# Face recognition engine
+face-recognition==1.3.0
+# face_recognition imports `pkg_resources` (removed in setuptools 81+),
+# so keep setuptools <81 until upstream migrates to importlib.resources.
+setuptools<81
+face_recognition_models @ git+https://github.com/ageitgey/face_recognition_models
+dlib==20.0.1
+opencv-python==4.9.0.80
+numpy==1.26.4
+Pillow==12.2.0
+
+# Web server
+fastapi==0.110.0
+uvicorn[standard]==0.27.1
+python-multipart==0.0.9
+
+# Validation / config
+pydantic==2.13.3
+pydantic-settings==2.14.0
+email-validator==2.3.0
+python-dotenv==1.2.2
+
+
+# Database — 2.0.36+ required for Python 3.14 compatibility
+SQLAlchemy==2.0.49
+
+# Required by dlib build on some platforms
+cmake==3.28.4
