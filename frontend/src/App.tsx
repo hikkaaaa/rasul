@@ -1,5 +1,6 @@
 import { AnimatePresence } from 'framer-motion';
 import { BrowserRouter, Route, Routes, useLocation } from 'react-router-dom';
+import { Clients } from './pages/Clients';
 import { Landing } from './pages/Landing';
 import { Login } from './pages/Login';
 import { Profile } from './pages/Profile';
@@ -14,6 +15,7 @@ function AnimatedRoutes() {
         <Route path="/signup" element={<Register />} />
         <Route path="/login" element={<Login />} />
         <Route path="/profile" element={<Profile />} />
+        <Route path="/clients" element={<Clients />} />
         <Route path="*" element={<Landing />} />
       </Routes>
     </AnimatePresence>

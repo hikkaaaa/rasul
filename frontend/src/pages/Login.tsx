@@ -5,8 +5,8 @@ import { Card } from '../components/Card';
 import { BackButton } from '../components/BackButton';
 import { PrimaryButton } from '../components/PrimaryButton';
 import { FaceScanner, type FaceScannerHandle, type ScannerPhase } from '../components/FaceScanner';
-import { ApiError, login } from '../lib/api';
-import { saveProfile } from '../lib/session';
+import { ApiError, fetchMe, login } from '../lib/api';
+import { saveSession } from '../lib/session';
 
 export function Login() {
   const navigate = useNavigate();
@@ -34,12 +34,15 @@ export function Login() {
     }, 60);
 
     try {
-      const { user } = await login(image);
+      const { user, token } = await login(image);
       clearInterval(tick);
       setProgress(100);
       setPhase('success');
       setStatus('Welcome back');
-      saveProfile(user);
+      // Fetch the permissions map up-front so the UI can render role-aware
+      // controls without an extra spinner on the next page.
+      const me = await fetchMe(token);
+      saveSession({ user, token, permissions: me.permissions });
       setTimeout(() => navigate('/profile'), 800);
     } catch (e) {
       clearInterval(tick);
