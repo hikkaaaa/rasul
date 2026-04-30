@@ -370,3 +370,84 @@ the system is modelled as a back-office RBAC tool, not a customer portal.
 5. The frontend's `/api/me` response carries a permissions map; pages use
    it to hide buttons. This is purely cosmetic — bypassing the UI still
    hits the same backend guards above.
+
+---
+
+## Landing Page & Route Structure
+
+The app no longer opens straight to a login card. Visiting the root URL
+now lands on a marketing/landing page; auth flows are reachable from the
+header buttons.
+
+### Route map
+
+| Route | Component | Purpose | Layout |
+|-------|-----------|---------|--------|
+| `/` | `pages/Landing.tsx` | Marketing landing page (hero, features, stats, CTA, footer). Header carries **Log In** + **Sign Up** buttons. | Full-bleed (no centered card) |
+| `/login` | `pages/Login.tsx` | Existing face-scan login card. | Centered card |
+| `/signup` | `pages/Register.tsx` | Existing multi-step face-scan registration. | Centered card |
+| `/profile` | `pages/Profile.tsx` | Authenticated user profile + role badge + clients link. | Centered card |
+| `/clients` | `pages/Clients.tsx` | RBAC-protected clients dashboard. | Centered card |
+| `*` | `pages/Landing.tsx` | Unknown URLs fall back to the landing page. | Full-bleed |
+
+The full-bleed vs. centered choice is controlled in `frontend/src/App.tsx`
+via `FULL_BLEED_ROUTES`. To make another future route own its own layout
+(e.g., a docs page), add its path to that set.
+
+### Modifying the landing page
+
+All landing copy lives in **one file**: `frontend/src/pages/Landing.tsx`.
+Common edits:
+
+| Want to change… | Edit this |
+|---|---|
+| The brand name / logo glyph in header & footer | `Logo()` and `Footer()` components |
+| Top nav link labels (`Features`, `Pricing`, `About`) | `<nav>` block inside `Header()` and the `Footer()` link list — anchors point at section IDs (`#features`, `#stats`, `#about`) |
+| Hero heading + subtitle | The `<h1>` and `<p>` inside `Hero()` |
+| Hero CTA button labels / destinations | The two `<Link>` elements at the bottom of `Hero()` |
+| The "trust" blurb (`4.8 · trusted by 500+ teams`) | The `<Stars />` block inside `Hero()` |
+| The 4 feature cards (title, copy, icon) | The `FEATURES` array near the top of the feature-grid section |
+| Stats numbers (latency, accuracy, etc.) | The `items` array inside `Stats()` |
+| Bullet list under "Built for teams that ship serious software" | The string array inside the `<ul>` in `Stats()` |
+| Closing CTA heading + buttons | `ClosingCTA()` |
+| Footer tagline / links | `Footer()` |
+
+To **add a new section** between two existing ones, write a function that
+returns a `<section>` and slot it into the `<main>` body of the top-level
+`Landing()` component — sections are rendered in source order. Each
+section uses the `useReveal()` hook + `motion.div` with
+`whileInView="show"` to get the same scroll-fade-in animation; copy that
+pattern for visual consistency.
+
+### Theme / dark mode
+
+The dark theme is global, defined in `frontend/src/index.css` via Tailwind
+`@theme` tokens:
+
+- `--color-cream-50` → page background (`#0f1117`)
+- `--color-cream-100` → card / surface background (`#1a1d27`)
+- `--color-gold-500` → primary action button (`#2563eb` / blue-600)
+- `--color-gold-300` / `--color-gold-400` → accent text & secondary button
+
+The landing page deliberately reuses these same tokens (rather than
+hard-coding hex values) so the hero, header, and feature cards transition
+seamlessly into the existing FaceID Access auth cards on `/login` and
+`/signup`. To re-theme the entire product (landing + cards) at once, edit
+the `@theme` block in `index.css` and every page picks it up.
+
+### Responsiveness
+
+The header collapses into a hamburger button below the `md` Tailwind
+breakpoint (768px). Tapping the hamburger toggles a vertical drawer with
+the same nav links plus stacked Log In / Sign Up buttons. Section
+typography and grids step down via Tailwind's `sm:` / `lg:` modifiers; no
+manual breakpoint logic needed.
+
+### Scroll-reveal animations
+
+Implemented with [Framer Motion](https://www.framer.com/motion/) — every
+section uses the `useReveal()` helper at the top of `Landing.tsx`, which
+returns a Variants object that fades + translates content as it enters
+the viewport. The hook respects `prefers-reduced-motion` and degrades to
+a static fade for users who've opted out of motion effects in their OS
+settings.
