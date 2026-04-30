@@ -1,13 +1,13 @@
 import { AnimatePresence } from 'framer-motion';
 import { BrowserRouter, Route, Routes, useLocation } from 'react-router-dom';
 import { Clients } from './pages/Clients';
+import { Invite } from './pages/Invite';
 import { Landing } from './pages/Landing';
 import { Login } from './pages/Login';
 import { Profile } from './pages/Profile';
 import { Register } from './pages/Register';
+import { Team } from './pages/Team';
 
-// Routes that own their own full-bleed layout (header, scroll, etc.)
-// shouldn't be wrapped in the centered card chrome.
 const FULL_BLEED_ROUTES = new Set<string>(['/']);
 
 function AnimatedRoutes() {
@@ -22,6 +22,8 @@ function AnimatedRoutes() {
         <Route path="/login" element={<Login />} />
         <Route path="/profile" element={<Profile />} />
         <Route path="/clients" element={<Clients />} />
+        <Route path="/team" element={<Team />} />
+        <Route path="/invite/:token" element={<Invite />} />
         <Route path="*" element={<Landing />} />
       </Routes>
     </AnimatePresence>

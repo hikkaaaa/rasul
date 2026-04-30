@@ -1,15 +1,18 @@
-"""Seed the database with the six RBAC test identities + sample clients.
+"""Seed the database with a default test organization, six RBAC test
+identities, and sample clients.
 
 Run from the backend directory after installing requirements:
 
     python seed.py             # additive: only inserts missing rows
     python seed.py --reset     # DROP all tables then re-create + seed
 
-Each test identity is created with `face_vector = NULL`. The first time
-someone signs up using one of these (name + email + IIN), the signup flow
-"claims" the slot — binding the new face to the pre-assigned role. That's
-how testers exercise different role levels without all sharing the same
-face.
+Each test identity is created with `face_vector = NULL` and
+`password_hash = NULL`. The first time someone signs up using one of
+these (matching email + IIN), the multi-step register flow "claims" the
+slot — binding the new face + password to the pre-assigned role.
+
+Ainur is flagged `is_account_owner=True` so she can invite teammates via
+the Team dashboard. The other five operators are regular members.
 """
 
 from __future__ import annotations
@@ -24,22 +27,21 @@ import models
 from models import Role
 
 
+TEST_ORG_NAME = "FaceID Test Co."
+
+
 # IINs are placeholders that satisfy the 12-digit format. Replace with real
 # Kazakhstan IINs if you intend to deploy this in production.
-# NOTE on the email domain: `email-validator` (used by Pydantic's EmailStr)
-# rejects reserved/special-use TLDs like `.test`, `.example`, `.local`,
-# `.localhost`, and `.invalid` per RFC 2606. We use `@faceid.app` (a real,
-# unrestricted TLD) so signup validation passes for the seeded accounts.
 TEST_USERS: list[dict] = [
-    # Level 1 — Admins (CRUD on clients)
-    {"full_name": "Ainur",  "email": "ainur@faceid.app",  "iin": "010101000001", "role": Role.ADMIN},
-    {"full_name": "Sultan", "email": "sultan@faceid.app", "iin": "010101000002", "role": Role.ADMIN},
+    # Level 1 — Admins (CRUD on clients). Ainur is the AccountOwner.
+    {"full_name": "Ainur",  "email": "ainur@faceid.app",  "iin": "010101000001", "role": Role.ADMIN,      "owner": True},
+    {"full_name": "Sultan", "email": "sultan@faceid.app", "iin": "010101000002", "role": Role.ADMIN,      "owner": False},
     # Level 2 — Accounting (read-all incl. credit card)
-    {"full_name": "Ivan",   "email": "ivan@faceid.app",   "iin": "010101000003", "role": Role.ACCOUNTANT},
-    {"full_name": "Erasyl", "email": "erasyl@faceid.app", "iin": "010101000004", "role": Role.ACCOUNTANT},
+    {"full_name": "Ivan",   "email": "ivan@faceid.app",   "iin": "010101000003", "role": Role.ACCOUNTANT, "owner": False},
+    {"full_name": "Erasyl", "email": "erasyl@faceid.app", "iin": "010101000004", "role": Role.ACCOUNTANT, "owner": False},
     # Level 3 — Marketing (restricted, no credit card visibility)
-    {"full_name": "Ahmed",  "email": "ahmed@faceid.app",  "iin": "010101000005", "role": Role.MARKETING},
-    {"full_name": "Peter",  "email": "peter@faceid.app",  "iin": "010101000006", "role": Role.MARKETING},
+    {"full_name": "Ahmed",  "email": "ahmed@faceid.app",  "iin": "010101000005", "role": Role.MARKETING,  "owner": False},
+    {"full_name": "Peter",  "email": "peter@faceid.app",  "iin": "010101000006", "role": Role.MARKETING,  "owner": False},
 ]
 
 
@@ -82,39 +84,59 @@ def ensure_schema() -> None:
     models.Base.metadata.create_all(bind=database.engine)
 
 
-def seed_users(db: Session) -> int:
-    """Insert any missing test users. Existing rows (matched by email) are
-    left untouched so you don't wipe out a face that's already enrolled."""
+def get_or_create_org(db: Session) -> models.Organization:
+    org = db.query(models.Organization).filter(models.Organization.name == TEST_ORG_NAME).first()
+    if org is not None:
+        return org
+    org = models.Organization(name=TEST_ORG_NAME)
+    db.add(org)
+    db.commit()
+    db.refresh(org)
+    print(f"  + organization: {TEST_ORG_NAME}")
+    return org
+
+
+def seed_users(db: Session, org: models.Organization) -> int:
     inserted = 0
     for spec in TEST_USERS:
         existing = db.query(models.User).filter(models.User.email == spec["email"]).first()
         if existing:
-            # If role drifted (e.g. someone manually changed it), realign.
+            # Realign role / organization / owner flag if drift has occurred,
+            # but leave any enrolled face vector + password alone.
+            changed = False
             if existing.role != spec["role"]:
-                existing.role = spec["role"]
-                print(f"  · {spec['email']}: realigned role → {spec['role'].value}")
+                existing.role = spec["role"]; changed = True
+            if existing.organization_id != org.id:
+                existing.organization_id = org.id; changed = True
+            if existing.is_account_owner != spec["owner"]:
+                existing.is_account_owner = spec["owner"]; changed = True
+            if changed:
+                print(f"  · {spec['email']}: realigned")
             continue
         user = models.User(
             full_name=spec["full_name"],
             email=spec["email"],
             iin=spec["iin"],
-            face_vector=None,  # claimed on first signup
+            face_vector=None,
+            password_hash=None,
             role=spec["role"],
+            organization_id=org.id,
+            is_account_owner=spec["owner"],
         )
         db.add(user)
         inserted += 1
-        print(f"  + {spec['email']:<24} ({spec['role'].value})")
+        owner_tag = " · OWNER" if spec["owner"] else ""
+        print(f"  + {spec['email']:<24} ({spec['role'].value}{owner_tag})")
     db.commit()
     return inserted
 
 
-def seed_clients(db: Session) -> int:
-    """Insert sample client records if the clients table is empty."""
-    if db.query(models.Client).count() > 0:
+def seed_clients(db: Session, org: models.Organization) -> int:
+    if db.query(models.Client).filter(models.Client.organization_id == org.id).count() > 0:
         return 0
     inserted = 0
     for spec in SAMPLE_CLIENTS:
-        client = models.Client(**spec)
+        client = models.Client(organization_id=org.id, **spec)
         db.add(client)
         inserted += 1
     db.commit()
@@ -133,17 +155,20 @@ def main() -> int:
 
     db = database.SessionLocal()
     try:
+        print("Seeding organization…")
+        org = get_or_create_org(db)
+
         print("Seeding test users…")
-        n_users = seed_users(db)
+        n_users = seed_users(db, org)
         print(f"  → {n_users} new user(s) inserted")
 
         print("Seeding sample clients…")
-        n_clients = seed_clients(db)
+        n_clients = seed_clients(db, org)
         print(f"  → {n_clients} new client(s) inserted")
     finally:
         db.close()
 
-    print("\nDone. Test identities are ready to be claimed via /signup.")
+    print(f"\nDone. Test identities are ready to be claimed via /signup → '{TEST_ORG_NAME}'.")
     print("See README → 'System Operations & Testing Guide' for usage.")
     return 0
 

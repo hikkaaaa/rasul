@@ -1,5 +1,6 @@
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from math import inf
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -22,7 +23,6 @@ logging.basicConfig(
 logger = logging.getLogger("face-api")
 
 
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     models.Base.metadata.create_all(bind=database.engine)
@@ -36,17 +36,17 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
     allow_credentials=False,
-    # PATCH/DELETE are needed for Admin client edits; OPTIONS for CORS preflight.
     allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
-    # Authorization is required so the bearer token can be sent cross-origin.
     allow_headers=["Content-Type", "Authorization"],
 )
 
 
-# Margin between best and second-best match below which we treat the result
-# as ambiguous and reject. Prevents leaking access when two registered users
-# look similar enough that the classifier can't confidently pick one.
+# Margin between best and second-best match below which a face login is
+# treated as ambiguous and rejected.
 LOGIN_AMBIGUITY_MARGIN = 0.05
+
+# Frontend origin used when minting invite redemption URLs in the response.
+INVITE_LINK_BASE = settings.cors_origins[0] if settings.cors_origins else "http://localhost:5173"
 
 
 @app.get("/")
@@ -54,94 +54,48 @@ def read_root():
     return {"message": "Face Recognition API is online"}
 
 
-# ─── Auth: signup, login, logout, me ────────────────────────────────────────
+# ─── Helpers ────────────────────────────────────────────────────────────────
 
 
-@app.post(
-    "/api/signup",
-    response_model=schemas.SignupResponse,
-    status_code=status.HTTP_201_CREATED,
-)
-def signup(
-    request: Request,
-    payload: schemas.SignupRequest,
-    db: Session = Depends(database.get_db),
-):
-    # Check for an existing user we might be claiming. A pre-seeded test user
-    # has a matching email + IIN but no face_vector yet — first signup binds
-    # the face to that pre-assigned role. This is the mechanism that makes
-    # role-specific test accounts (Ainur=Admin, Ahmed=Marketing, etc.) work
-    # without forcing testers to also have those exact faces.
-    existing_email = db.query(models.User).filter(models.User.email == str(payload.email)).first()
-    existing_iin = db.query(models.User).filter(models.User.iin == payload.iin).first()
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
 
-    claim_target: models.User | None = None
-    if existing_email and existing_iin and existing_email.id == existing_iin.id and existing_email.face_vector is None:
-        claim_target = existing_email
-    else:
-        if existing_iin:
-            logger.info("signup.conflict field=iin")
-            raise HTTPException(status.HTTP_409_CONFLICT, detail="IIN already registered")
-        if existing_email:
-            logger.info("signup.conflict field=email")
-            raise HTTPException(status.HTTP_409_CONFLICT, detail="Email already registered")
 
-    # Challenge frames must contain exactly one neutral + three distinct challenges.
+def _validate_frame_set(frames: list[schemas.FrameCapture]) -> dict[str, face_logic.FrameAnalysis]:
+    """Decodes + verifies the 4 challenge frames and returns the analyses
+    keyed by challenge name. Shared between the new register flow and the
+    invite-redemption flow."""
     by_type: dict[str, schemas.FrameCapture] = {}
-    for frame in payload.frames:
+    for frame in frames:
         if frame.challenge in by_type:
-            raise HTTPException(
-                status.HTTP_422_UNPROCESSABLE_ENTITY,
-                detail=f"Duplicate challenge frame: {frame.challenge}",
-            )
+            raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=f"Duplicate challenge frame: {frame.challenge}")
         by_type[frame.challenge] = frame
 
     if "neutral" not in by_type:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Missing neutral-pose frame",
-        )
-
-    horizontal = {"turn_left", "turn_right"} & set(by_type)
-    vertical = {"look_up", "look_down"} & set(by_type)
-    if not horizontal:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Missing horizontal head-turn challenge",
-        )
-    if not vertical:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Missing vertical head-turn challenge",
-        )
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing neutral-pose frame")
+    if not ({"turn_left", "turn_right"} & set(by_type)):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing horizontal head-turn challenge")
+    if not ({"look_up", "look_down"} & set(by_type)):
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing vertical head-turn challenge")
     if "smile" not in by_type:
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="Missing smile challenge",
-        )
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Missing smile challenge")
 
-    # Analyze each frame (decode, detect face, landmarks, quality checks).
     analyses: dict[str, face_logic.FrameAnalysis] = {}
     for challenge, frame in by_type.items():
         try:
             analysis = face_logic.analyze_frame(frame.image)
         except face_logic.ImageValidationError as exc:
-            logger.info("signup.invalid_image challenge=%s reason=%s", challenge, exc)
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
         except face_logic.LivenessError as exc:
-            logger.info("signup.liveness_fail challenge=%s reason=%s", challenge, exc)
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
         analyses[challenge] = analysis
 
-    # Per-challenge pose/expression verification.
     for challenge, analysis in analyses.items():
         try:
             face_logic.verify_challenge(analysis, challenge)  # type: ignore[arg-type]
         except face_logic.LivenessError as exc:
-            logger.info("signup.challenge_fail challenge=%s reason=%s", challenge, exc)
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
 
-    # All frames must be the same person as the neutral pose.
     neutral = analyses["neutral"]
     for challenge, analysis in analyses.items():
         if challenge == "neutral":
@@ -149,88 +103,212 @@ def signup(
         try:
             face_logic.ensure_same_person(neutral, analysis)
         except face_logic.LivenessError as exc:
-            logger.info("signup.identity_drift challenge=%s reason=%s", challenge, exc)
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
 
-    # Duplicate-face guard: reject if this face is already registered under
-    # another account. (Skipped for the user we're claiming, since they have
-    # no embedding yet — they're the slot the face is going into.)
-    new_vector = neutral.embedding
+    return analyses
+
+
+def _check_duplicate_face(db: Session, vector: list[float], skip_user_id: int | None = None) -> None:
+    """Rejects if `vector` matches a face already enrolled under another
+    user. Optionally skip a specific user (the one being claimed)."""
     for existing in db.query(models.User).all():
         if existing.face_vector is None:
             continue
-        if claim_target is not None and existing.id == claim_target.id:
+        if skip_user_id is not None and existing.id == skip_user_id:
             continue
-        distance = face_logic.face_distance(existing.face_vector, new_vector)
+        distance = face_logic.face_distance(existing.face_vector, vector)
         if distance < settings.duplicate_face_distance:
-            logger.info(
-                "signup.duplicate_face existing_user_id=%d distance=%.3f",
-                existing.id,
-                distance,
-            )
             raise HTTPException(
                 status.HTTP_409_CONFLICT,
                 detail="This face is already linked to another account. Please return to the homepage and sign in instead.",
             )
 
-    if claim_target is not None:
-        # Claim flow: keep the pre-assigned role, attach the new face vector.
-        claim_target.full_name = payload.name
-        claim_target.face_vector = new_vector
-        db.commit()
-        db.refresh(claim_target)
-        logger.info("signup.claim user_id=%d role=%s", claim_target.id, claim_target.role.value)
-        return schemas.SignupResponse(
-            status="success",
-            message=f"Face enrolled for {payload.name} ({claim_target.role.value})",
-            role=claim_target.role,
+
+def _find_claimable_user(db: Session, email: str, iin: str) -> models.User | None:
+    """A pre-seeded test user can be 'claimed' on first signup: same email
+    + IIN, no face yet. Returns the row to bind to, or None."""
+    existing_email = db.query(models.User).filter(models.User.email == email).first()
+    if not existing_email or existing_email.face_vector is not None:
+        return None
+    existing_iin = db.query(models.User).filter(models.User.iin == iin).first()
+    if existing_iin and existing_iin.id == existing_email.id:
+        return existing_email
+    return None
+
+
+def _resolve_invite(db: Session, token: str) -> models.Invite:
+    invite = auth.find_active_invite(db, token)
+    if invite is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Invite token not found")
+    if invite.revoked:
+        raise HTTPException(status.HTTP_410_GONE, detail="Invite has been revoked")
+    if invite.used_at is not None:
+        raise HTTPException(status.HTTP_410_GONE, detail="Invite has already been used")
+    expiry = invite.expires_at
+    # SQLite returns naive datetimes; normalize for comparison.
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+    if expiry < _utcnow():
+        raise HTTPException(status.HTTP_410_GONE, detail="Invite has expired")
+    return invite
+
+
+# ─── Multi-step registration ───────────────────────────────────────────────
+
+
+@app.post("/api/register/check", response_model=schemas.RegisterCheckResponse)
+def register_check(payload: schemas.RegisterCheckRequest, db: Session = Depends(database.get_db)):
+    """Step 1 validation. The frontend gates the transition to Step 2 on a
+    `status == "ok"` (or "claim") response."""
+    email = str(payload.email)
+    company = payload.company_name.strip()
+
+    # Pre-seeded user claim path: email matches a User with no face_vector.
+    existing_email = db.query(models.User).filter(models.User.email == email).first()
+    if existing_email and existing_email.face_vector is None:
+        return schemas.RegisterCheckResponse(
+            status="claim",
+            message=f"Welcome back — your '{existing_email.full_name}' account is ready to enrol.",
+            organization_name=existing_email.organization.name if existing_email.organization else None,
+            role=existing_email.role,
         )
 
-    # Brand-new self-registration → default to lowest-privilege role. Admins
-    # provision elevated roles deliberately via seeding.
-    user = models.User(
-        full_name=payload.name,
-        email=str(payload.email),
-        iin=payload.iin,
-        face_vector=new_vector,
-        role=Role.MARKETING,
-    )
-    db.add(user)
+    if existing_email:
+        return schemas.RegisterCheckResponse(status="conflict_email", message="That email is already registered")
+
+    existing_org = db.query(models.Organization).filter(models.Organization.name == company).first()
+    if existing_org:
+        # Company exists but caller is not a known member of it. The spec
+        # disallows self-joining an existing company — enrolment must go
+        # through an invite link.
+        return schemas.RegisterCheckResponse(
+            status="conflict_company",
+            message="That company already exists. Ask its account owner to send you an invite.",
+        )
+
+    return schemas.RegisterCheckResponse(status="ok", message="Looks good — continue to the next step.")
+
+
+@app.post(
+    "/api/register",
+    response_model=schemas.RegisterResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+def register(payload: schemas.RegisterRequest, db: Session = Depends(database.get_db)):
+    email = str(payload.email)
+    company = payload.company_name.strip()
+
+    invite: models.Invite | None = None
+    if payload.invite_token:
+        invite = _resolve_invite(db, payload.invite_token)
+        if invite.email.lower() != email.lower():
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="Invite is for a different email address")
+
+    # Path A — claim a pre-seeded user (email matches, no face yet).
+    claim_target = _find_claimable_user(db, email, payload.iin) if invite is None else None
+
+    # Path B — invite redemption (no claim, no new company).
+    if invite is not None:
+        # Email collision with an *active* user is still a conflict, even
+        # under an invite — the slot is taken.
+        existing = db.query(models.User).filter(models.User.email == email).first()
+        if existing is not None:
+            raise HTTPException(status.HTTP_409_CONFLICT, detail="An account with that email already exists")
+        if db.query(models.User).filter(models.User.iin == payload.iin).first():
+            raise HTTPException(status.HTTP_409_CONFLICT, detail="IIN already registered")
+        organization = invite.organization
+        role = invite.role
+        is_owner = False
+
+    # Path C — pre-seeded claim.
+    elif claim_target is not None:
+        organization = claim_target.organization
+        role = claim_target.role
+        is_owner = claim_target.is_account_owner
+
+    # Path D — brand-new company creation.
+    else:
+        if db.query(models.User).filter(models.User.email == email).first():
+            raise HTTPException(status.HTTP_409_CONFLICT, detail="Email already registered")
+        if db.query(models.User).filter(models.User.iin == payload.iin).first():
+            raise HTTPException(status.HTTP_409_CONFLICT, detail="IIN already registered")
+        if db.query(models.Organization).filter(models.Organization.name == company).first():
+            raise HTTPException(status.HTTP_409_CONFLICT, detail="Company name already exists")
+        organization = models.Organization(name=company)
+        db.add(organization)
+        db.flush()  # need org.id below
+        role = Role.ADMIN
+        is_owner = True  # first user of a new company → AccountOwner
+
+    # Verify the 4-frame liveness sequence.
+    analyses = _validate_frame_set(payload.frames)
+    new_vector = analyses["neutral"].embedding
+
+    _check_duplicate_face(db, new_vector, skip_user_id=claim_target.id if claim_target else None)
+
+    pwd_hash = auth.hash_password(payload.password)
+
+    if claim_target is not None:
+        claim_target.full_name = payload.name
+        claim_target.face_vector = new_vector
+        claim_target.password_hash = pwd_hash
+        claim_target.phone = payload.phone or None
+        claim_target.position = payload.position
+        user = claim_target
+    else:
+        user = models.User(
+            full_name=payload.name,
+            email=email,
+            iin=payload.iin,
+            password_hash=pwd_hash,
+            phone=payload.phone or None,
+            position=payload.position,
+            face_vector=new_vector,
+            role=role,
+            organization_id=organization.id,
+            is_account_owner=is_owner,
+        )
+        db.add(user)
+
+    if invite is not None:
+        invite.used_at = _utcnow()
+
     db.commit()
     db.refresh(user)
-    logger.info("signup.success user_id=%d role=%s", user.id, user.role.value)
-    return schemas.SignupResponse(
-        status="success",
-        message=f"User {payload.name} registered",
-        role=user.role,
+
+    token = auth.issue_token(db, user)
+
+    logger.info(
+        "register.success user_id=%d org_id=%d role=%s owner=%s path=%s",
+        user.id, user.organization_id, user.role.value, user.is_account_owner,
+        "invite" if invite else ("claim" if claim_target else "new_company"),
     )
+
+    return schemas.RegisterResponse(
+        status="success",
+        message=f"Welcome, {user.full_name}",
+        role=user.role,
+        is_account_owner=user.is_account_owner,
+        token=token,
+        user=schemas.UserPublic(**auth.public_user(user)),
+    )
+
+
+# ─── Login / session ───────────────────────────────────────────────────────
 
 
 @app.post("/api/login", response_model=schemas.LoginResponse)
-def login(
-    request: Request,
-    payload: schemas.LoginRequest,
-    db: Session = Depends(database.get_db),
-):
+def login(request: Request, payload: schemas.LoginRequest, db: Session = Depends(database.get_db)):
     client_addr = request.client.host if request.client else "unknown"
 
     try:
         candidate = face_logic.get_embedding(payload.image)
     except face_logic.ImageValidationError as exc:
-        logger.info("login.invalid_image client=%s reason=%s", client_addr, exc)
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
 
     if candidate is None:
-        logger.info("login.no_face client=%s", client_addr)
-        raise HTTPException(
-            status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="No single clear face detected in the image",
-        )
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="No single clear face detected in the image")
 
-    # Nearest-neighbour search. Fine up to ~1k users; beyond that swap to a
-    # vector DB (pgvector / Milvus) and do ANN search. See README.
-    # Skip pre-seeded users that haven't enrolled their face yet — they have
-    # no embedding to compare against.
     best_user: models.User | None = None
     best_distance = inf
     second_best_distance = inf
@@ -246,57 +324,24 @@ def login(
             second_best_distance = distance
 
     if best_user is None or best_distance > settings.face_tolerance:
-        logger.warning(
-            "login.denied client=%s best_distance=%.3f",
-            client_addr,
-            best_distance if best_user else -1,
-        )
+        logger.warning("login.denied client=%s best=%.3f", client_addr, best_distance if best_user else -1)
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Face not recognized")
 
     if second_best_distance - best_distance < LOGIN_AMBIGUITY_MARGIN:
-        logger.warning(
-            "login.ambiguous client=%s best=%.3f second=%.3f",
-            client_addr,
-            best_distance,
-            second_best_distance,
-        )
-        raise HTTPException(
-            status.HTTP_401_UNAUTHORIZED,
-            detail="Could not confidently identify you — please try again",
-        )
+        logger.warning("login.ambiguous client=%s", client_addr)
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Could not confidently identify you — please try again")
 
-    # Mint a bearer token. The frontend stores it and sends it as
-    # `Authorization: Bearer <token>` on every protected request.
     token = auth.issue_token(db, best_user)
-
-    logger.info(
-        "login.success user_id=%d role=%s client=%s distance=%.3f",
-        best_user.id,
-        best_user.role.value,
-        client_addr,
-        best_distance,
-    )
+    logger.info("login.success user_id=%d role=%s org_id=%d", best_user.id, best_user.role.value, best_user.organization_id)
     return schemas.LoginResponse(
         status="authorized",
-        user=schemas.UserPublic(
-            name=best_user.full_name,
-            email=best_user.email,
-            iin=best_user.iin,
-            role=best_user.role,
-        ),
+        user=schemas.UserPublic(**auth.public_user(best_user)),
         token=token,
     )
 
 
 @app.post("/api/logout", status_code=status.HTTP_204_NO_CONTENT)
-def logout(
-    db: Session = Depends(database.get_db),
-    user: models.User = Depends(auth.get_current_user),
-):
-    # Revokes every active session for this user. Simpler than threading the
-    # specific token through the dependency, and aligns with "sign out
-    # everywhere" semantics — fine for a face-auth system where the user
-    # only has one active client at a time anyway.
+def logout(db: Session = Depends(database.get_db), user: models.User = Depends(auth.get_current_user)):
     sessions = db.query(models.AuthSession).filter(
         models.AuthSession.user_id == user.id,
         models.AuthSession.revoked.is_(False),
@@ -309,64 +354,188 @@ def logout(
 
 @app.get("/api/me", response_model=schemas.MeResponse)
 def me(user: models.User = Depends(auth.get_current_user)):
-    """Returns the caller's identity + permissions map. The frontend uses
-    the permissions map to decide which buttons to render; the backend still
-    enforces the same rules independently on every protected route."""
     return schemas.MeResponse(
-        user=schemas.UserPublic(
-            name=user.full_name,
-            email=user.email,
-            iin=user.iin,
-            role=user.role,
-        ),
-        permissions=auth.permissions_for(user.role),
+        user=schemas.UserPublic(**auth.public_user(user)),
+        permissions=auth.permissions_for(user),
     )
 
 
 @app.post("/api/validate-challenge", response_model=schemas.ValidateChallengeResponse)
-def validate_challenge(
-    request: Request,
-    payload: schemas.ValidateChallengeRequest,
-):
+def validate_challenge(payload: schemas.ValidateChallengeRequest):
     try:
         analysis = face_logic.analyze_frame(payload.image)
         face_logic.verify_challenge(analysis, payload.challenge)
-
-        # If it's not neutral and we got a neutral embedding, ensure same person
         if payload.challenge != "neutral" and payload.neutral_embedding:
             dist = face_logic.face_distance(payload.neutral_embedding, analysis.embedding)
             if dist > settings.face_tolerance:
-                 raise face_logic.LivenessError(f"Identity drift detected (dist={dist:.3f}) - please stay in frame")
-
-        return schemas.ValidateChallengeResponse(
-            status="success",
-            message="Valid",
-            embedding=analysis.embedding
-        )
+                raise face_logic.LivenessError(f"Identity drift detected (dist={dist:.3f}) - please stay in frame")
+        return schemas.ValidateChallengeResponse(status="success", message="Valid", embedding=analysis.embedding)
     except face_logic.ImageValidationError as exc:
-        return schemas.ValidateChallengeResponse(
-            status="error",
-            message=str(exc)
-        )
+        return schemas.ValidateChallengeResponse(status="error", message=str(exc))
     except face_logic.LivenessError as exc:
-        return schemas.ValidateChallengeResponse(
-            status="error",
-            message=str(exc)
+        return schemas.ValidateChallengeResponse(status="error", message=str(exc))
+
+
+# ─── Team & invites (Account Owner only) ───────────────────────────────────
+
+
+@app.get("/api/team", response_model=list[schemas.TeamMember])
+def list_team(user: models.User = Depends(auth.get_current_user), db: Session = Depends(database.get_db)):
+    """List members of the caller's organization. All authenticated users in
+    the org can read the roster (so they can see who their teammates are);
+    only the AccountOwner can mutate it."""
+    members = (
+        db.query(models.User)
+        .filter(models.User.organization_id == user.organization_id)
+        .order_by(models.User.id.asc())
+        .all()
+    )
+    return [
+        schemas.TeamMember(
+            id=m.id,
+            name=m.full_name,
+            email=m.email,
+            role=m.role,
+            position=m.position,
+            is_account_owner=m.is_account_owner,
+            has_face=m.face_vector is not None,
+            created_at=m.created_at,
         )
+        for m in members
+    ]
 
 
-# ─── Clients (RBAC-controlled resource) ─────────────────────────────────────
-#
-# Permission matrix:
-#   GET    /api/clients          → Admin, Accountant, Marketing  (read)
-#   GET    /api/clients/{id}     → Admin, Accountant, Marketing  (read)
-#   POST   /api/clients          → Admin only                    (create)
-#   PATCH  /api/clients/{id}     → Admin only                    (update)
-#   DELETE /api/clients/{id}     → Admin only                    (delete)
-#
-# Marketing role gets `credit_card` masked via auth.serialize_client; the
-# write endpoints rely on require_role() to short-circuit at 403 before any
-# business logic runs.
+@app.get("/api/invites", response_model=list[schemas.InviteRead])
+def list_invites(
+    user: models.User = Depends(auth.require_account_owner),
+    db: Session = Depends(database.get_db),
+):
+    rows = (
+        db.query(models.Invite)
+        .filter(models.Invite.organization_id == user.organization_id)
+        .order_by(models.Invite.id.desc())
+        .all()
+    )
+    return [
+        schemas.InviteRead(
+            id=i.id,
+            email=i.email,
+            role=i.role,
+            expires_at=i.expires_at,
+            used_at=i.used_at,
+            revoked=i.revoked,
+            redemption_url=f"{INVITE_LINK_BASE}/invite/{i.token}",
+            created_at=i.created_at,
+        )
+        for i in rows
+    ]
+
+
+@app.post("/api/invites", response_model=schemas.InviteRead, status_code=status.HTTP_201_CREATED)
+def create_invite(
+    payload: schemas.InviteCreate,
+    user: models.User = Depends(auth.require_account_owner),
+    db: Session = Depends(database.get_db),
+):
+    email = str(payload.email).lower()
+
+    # Don't issue an invite for an email that already has an account
+    # *anywhere* (in this org or another) — it would be unusable.
+    if db.query(models.User).filter(models.User.email == email).first():
+        raise HTTPException(status.HTTP_409_CONFLICT, detail="A user with that email already exists")
+
+    # If a still-active invite already exists for this email in this org,
+    # revoke it before issuing a new one. Avoids stale links.
+    existing = (
+        db.query(models.Invite)
+        .filter(
+            models.Invite.email == email,
+            models.Invite.organization_id == user.organization_id,
+            models.Invite.used_at.is_(None),
+            models.Invite.revoked.is_(False),
+        )
+        .all()
+    )
+    for old in existing:
+        old.revoked = True
+
+    invite = models.Invite(
+        token=auth.mint_invite_token(),
+        email=email,
+        role=payload.role,
+        organization_id=user.organization_id,
+        created_by_user_id=user.id,
+    )
+    db.add(invite)
+    db.commit()
+    db.refresh(invite)
+    logger.info("invite.create id=%d email=%s role=%s by_user=%d", invite.id, email, payload.role.value, user.id)
+    return schemas.InviteRead(
+        id=invite.id,
+        email=invite.email,
+        role=invite.role,
+        expires_at=invite.expires_at,
+        used_at=invite.used_at,
+        revoked=invite.revoked,
+        redemption_url=f"{INVITE_LINK_BASE}/invite/{invite.token}",
+        created_at=invite.created_at,
+    )
+
+
+@app.delete("/api/invites/{invite_id}", status_code=status.HTTP_204_NO_CONTENT)
+def revoke_invite(
+    invite_id: int,
+    user: models.User = Depends(auth.require_account_owner),
+    db: Session = Depends(database.get_db),
+):
+    invite = (
+        db.query(models.Invite)
+        .filter(models.Invite.id == invite_id, models.Invite.organization_id == user.organization_id)
+        .first()
+    )
+    if invite is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Invite not found")
+    invite.revoked = True
+    db.commit()
+    return None
+
+
+@app.get("/api/invites/{token}/preview", response_model=schemas.InvitePreview)
+def preview_invite(token: str, db: Session = Depends(database.get_db)):
+    """Public — used by the /invite/:token landing page to render the
+    invitee's email + assigned role + organization before they fill out
+    the form. Returns a `valid: false` payload (rather than 404) so the
+    UI can show a friendly explanation."""
+    invite = auth.find_active_invite(db, token)
+    if invite is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Invite not found")
+    expiry = invite.expires_at
+    if expiry.tzinfo is None:
+        expiry = expiry.replace(tzinfo=timezone.utc)
+
+    valid = True
+    reason: str | None = None
+    if invite.revoked:
+        valid = False
+        reason = "This invite has been revoked."
+    elif invite.used_at is not None:
+        valid = False
+        reason = "This invite has already been used."
+    elif expiry < _utcnow():
+        valid = False
+        reason = "This invite has expired."
+
+    return schemas.InvitePreview(
+        email=invite.email,
+        role=invite.role,
+        organization_name=invite.organization.name,
+        expires_at=invite.expires_at,
+        valid=valid,
+        reason=reason,
+    )
+
+
+# ─── Clients (RBAC + org-scoped) ───────────────────────────────────────────
 
 
 _ALL_READ_ROLES = (Role.ADMIN, Role.ACCOUNTANT, Role.MARKETING)
@@ -377,7 +546,12 @@ def list_clients(
     user: models.User = Depends(auth.require_role(*_ALL_READ_ROLES)),
     db: Session = Depends(database.get_db),
 ):
-    rows = db.query(models.Client).order_by(models.Client.id.asc()).all()
+    rows = (
+        db.query(models.Client)
+        .filter(models.Client.organization_id == user.organization_id)
+        .order_by(models.Client.id.asc())
+        .all()
+    )
     return [auth.serialize_client(c, user.role) for c in rows]
 
 
@@ -387,7 +561,11 @@ def get_client(
     user: models.User = Depends(auth.require_role(*_ALL_READ_ROLES)),
     db: Session = Depends(database.get_db),
 ):
-    client = db.query(models.Client).filter(models.Client.id == client_id).first()
+    client = (
+        db.query(models.Client)
+        .filter(models.Client.id == client_id, models.Client.organization_id == user.organization_id)
+        .first()
+    )
     if client is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Client not found")
     return auth.serialize_client(client, user.role)
@@ -400,6 +578,7 @@ def create_client(
     db: Session = Depends(database.get_db),
 ):
     client = models.Client(
+        organization_id=user.organization_id,  # always scoped to caller's org
         full_name=payload.full_name,
         address=payload.address,
         phone=payload.phone,
@@ -408,7 +587,7 @@ def create_client(
     db.add(client)
     db.commit()
     db.refresh(client)
-    logger.info("client.create id=%d by_user=%d", client.id, user.id)
+    logger.info("client.create id=%d org_id=%d by_user=%d", client.id, user.organization_id, user.id)
     return auth.serialize_client(client, user.role)
 
 
@@ -419,16 +598,19 @@ def update_client(
     user: models.User = Depends(auth.require_role(Role.ADMIN)),
     db: Session = Depends(database.get_db),
 ):
-    client = db.query(models.Client).filter(models.Client.id == client_id).first()
+    client = (
+        db.query(models.Client)
+        .filter(models.Client.id == client_id, models.Client.organization_id == user.organization_id)
+        .first()
+    )
     if client is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Client not found")
-    # Patch semantics: only update the fields the caller actually sent.
     data = payload.model_dump(exclude_unset=True)
     for field, value in data.items():
         setattr(client, field, value)
     db.commit()
     db.refresh(client)
-    logger.info("client.update id=%d by_user=%d fields=%s", client.id, user.id, list(data.keys()))
+    logger.info("client.update id=%d by_user=%d", client.id, user.id)
     return auth.serialize_client(client, user.role)
 
 
@@ -438,7 +620,11 @@ def delete_client(
     user: models.User = Depends(auth.require_role(Role.ADMIN)),
     db: Session = Depends(database.get_db),
 ):
-    client = db.query(models.Client).filter(models.Client.id == client_id).first()
+    client = (
+        db.query(models.Client)
+        .filter(models.Client.id == client_id, models.Client.organization_id == user.organization_id)
+        .first()
+    )
     if client is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Client not found")
     db.delete(client)

@@ -451,3 +451,181 @@ returns a Variants object that fades + translates content as it enters
 the viewport. The hook respects `prefers-reduced-motion` and degrades to
 a static fade for users who've opted out of motion effects in their OS
 settings.
+
+---
+
+## Multi-Step Onboarding & Team Management
+
+The signup flow has been upgraded from a single-card form to a 3-step
+stepper that creates an **Organization** as well as a User on first
+registration. Subsequent teammates join via single-use **invite links**
+issued by the Account Owner.
+
+### The 3-step register flow
+
+`/signup` (`frontend/src/pages/Register.tsx`) walks the user through:
+
+1. **Basic Details** — full name, email, password (≥ 8 chars), company
+   name, plus the "info is true" checkbox. Submitting this step posts to
+   `POST /api/register/check`, which returns:
+   - `ok` → company is new, email is new → advance.
+   - `claim` → email matches a pre-seeded user with no enrolled face yet
+     (e.g. one of the seeded test identities). The new password and
+     position will bind to that pre-assigned role + organization. The UI
+     surfaces a "Claiming an existing account in X" banner on Step 2.
+   - `conflict_email` → reject; that address already has an active user.
+   - `conflict_company` → reject; an org with that name already exists
+     and the user isn't a known member of it. They have to ask the
+     account owner for an invite link instead.
+2. **Contact Details** — phone number, IIN (12 digits), and a
+   Position/Role select (`Owner` / `Manager` / `Staff`). Position is a
+   free-form job title — it's distinct from the system permission Role,
+   which is auto-assigned.
+3. **Verification** — the existing 4-frame liveness sequence (neutral +
+   randomized horizontal + randomized vertical + smile). On success, the
+   final `POST /api/register` call creates the User row, mints a bearer
+   token, and the frontend lands on `/team` (account owners) or
+   `/profile` (everyone else).
+
+Smooth horizontal slide-in transitions between steps (signed `direction`
+prop on `SlideIn`) — going forward slides left, going back slides right.
+The component respects `prefers-reduced-motion` via Framer Motion.
+
+### Account Owner / SuperAdmin
+
+The first user to register a brand-new company is automatically flagged
+`is_account_owner = True` in `users.is_account_owner` and assigned
+`role = Admin`. This combination grants full client CRUD **plus** the
+ability to manage the team roster.
+
+| Capability | Owner (`is_account_owner=True`) | Regular Admin | Accountant | Marketing |
+|---|:---:|:---:|:---:|:---:|
+| Full client CRUD | ✅ | ✅ | ❌ | ❌ |
+| Read clients | ✅ | ✅ | ✅ | ✅ |
+| View credit card cleartext | ✅ | ✅ | ✅ | ❌ |
+| **Invite teammates** | ✅ | ❌ | ❌ | ❌ |
+| **Revoke invites** | ✅ | ❌ | ❌ | ❌ |
+| **List team roster** (read) | ✅ | ✅ | ✅ | ✅ |
+| Access `/team` page | ✅ | ❌ | ❌ | ❌ |
+
+Note: `is_account_owner` is set automatically on first registration of a
+company; there is no UI to grant it post-hoc. To transfer ownership in
+production you'd flip the flag in the database directly.
+
+### The invite system (admin-led onboarding)
+
+Once an Account Owner is set up, no new self-registration is allowed
+into their organization — anyone trying to register with that company
+name will be rejected with `conflict_company`. New teammates are added
+through invite links:
+
+1. Owner opens **`/team`** ("Manage team" button on `/profile`, only
+   visible to owners) and enters `{ email, role }` in the Invite a
+   teammate form.
+2. `POST /api/invites` mints a 32-byte hex token, persists an `Invite`
+   row, and returns a redemption URL of the shape
+   `http://localhost:5173/invite/<token>`. (No SMTP wired in dev — the
+   owner copies the link and shares it manually. The Team page surfaces
+   the most recent link in a copyable callout.)
+3. Invitee opens the link → `Invite.tsx` → `GET /api/invites/<token>/preview`
+   shows them their pre-locked email, role, and organization.
+4. They fill in name + password + phone + IIN + position, then run the
+   same 3-frame liveness sequence.
+5. `POST /api/register` is called with `invite_token` set; the backend
+   uses the invite's `organization_id` and `role` (ignoring whatever the
+   form said for company name), marks the invite `used_at`, and creates
+   the User as a non-owner.
+
+**Invite lifecycle:** invites expire after 7 days. The Owner can revoke
+a pending invite from `/team`. Revoked, expired, or already-used invites
+return `valid: false` from the preview endpoint with a friendly reason
+the UI surfaces. Re-inviting the same email automatically revokes any
+still-active prior invites for that address in the same org.
+
+### Schema changes
+
+The data model now includes:
+
+- **`organizations`** — `id`, `name` (unique), `created_at`. One row per
+  company / tenant.
+- **`users`** — extended with `organization_id` (FK, required),
+  `password_hash` (PBKDF2-SHA256, nullable), `phone`, `position`,
+  `is_account_owner`. `face_vector` is still nullable so seeded /
+  invited users can claim their slot.
+- **`invites`** — `id`, `token`, `email`, `role`, `organization_id`,
+  `created_by_user_id`, `expires_at`, `used_at`, `revoked`, `created_at`.
+- **`clients`** — gained `organization_id` (FK). All client CRUD now
+  filters by `Client.organization_id == current_user.organization_id` —
+  cross-tenant reads are impossible by construction.
+
+A schema reset is required (`python seed.py --reset`); the existing
+`face_system.db` from the previous milestone has none of these columns.
+
+### New backend endpoints
+
+| Method | Path | Auth | Notes |
+|---|---|---|---|
+| `POST` | `/api/register/check` | public | Step 1 dup-check; returns `ok` / `claim` / `conflict_email` / `conflict_company`. |
+| `POST` | `/api/register` | public | Final 3-step submission. Optional `invite_token` selects invite-redemption flow. |
+| `GET` | `/api/team` | any authenticated | Lists members of caller's org. |
+| `POST` | `/api/invites` | **Account Owner only** | Mints a 7-day invite. Auto-revokes prior active invites for the same email. |
+| `GET` | `/api/invites` | **Account Owner only** | Lists invites in caller's org. |
+| `DELETE` | `/api/invites/{id}` | **Account Owner only** | Revoke. |
+| `GET` | `/api/invites/{token}/preview` | public | For the redemption landing page. Returns `valid: false` for revoked/used/expired tokens. |
+
+The legacy `POST /api/signup` is gone — the multi-step flow replaces
+it. Login (`POST /api/login`) is unchanged: face-only, returns
+`{ user, token }`. The login response and `/api/me` payload now include
+`organization_id`, `organization_name`, `is_account_owner`, and
+`position`.
+
+### Organization scoping (the security guarantee)
+
+Every protected endpoint that returns or mutates data filters on
+`organization_id == current_user.organization_id`:
+
+- `GET /api/clients` only returns clients in the caller's org.
+- `GET /api/clients/{id}` 404s for clients in a different org (rather
+  than 403, to avoid leaking the existence of cross-tenant rows).
+- `POST /api/clients` always sets `organization_id` from the caller —
+  the request body cannot influence it.
+- `PATCH` / `DELETE` 404 if the row isn't in the caller's org.
+- Team and invite lookups filter the same way.
+
+Combined with the role guards (`require_role`, `require_account_owner`),
+this means a malicious Marketing user in org A cannot read, write, or
+even discover the existence of org B's data, even by hitting the API
+directly with a forged Authorization header against another user's
+token (since each token resolves to a single User → single org).
+
+### Testing the new flow
+
+After `python seed.py --reset` the test environment looks like:
+
+- Organization "FaceID Test Co." with the 6 seeded users.
+- **Ainur** is the Account Owner — register her first and you'll land on
+  `/team`, where you can invite anyone.
+- The other five (Sultan / Ivan / Erasyl / Ahmed / Peter) are non-owner
+  members. They can be claimed via `/signup` like before; they cannot
+  invite teammates.
+- All four sample clients live inside that one organization.
+
+To test the invite system end-to-end without a second machine:
+
+1. Register as Ainur (Step 1: name=Ainur, email=`ainur@faceid.app`,
+   pick any password, company=`FaceID Test Co.` → claim path).
+2. From `/team`, invite a brand-new email + Role.
+3. Sign out, copy the redemption URL, open it in an incognito window.
+4. Fill in name/password/phone/IIN, run the face scan — you'll join
+   `FaceID Test Co.` with the role from the invite.
+
+### Modifying the onboarding text
+
+| Want to change… | Edit this |
+|---|---|
+| Step labels in the breadcrumb (`Basic Details`, etc.) | The `STEPS` array in `Register.tsx` |
+| Step 1 fields / validation rules | `BasicsStep` in `Register.tsx` |
+| Step 2 fields / validation rules | `ContactStep` in `Register.tsx` |
+| Liveness pose sequence (number of poses, prompts) | `buildSequence()` in `components/LivenessScanStep.tsx` |
+| Invite expiry window | `_invite_default_expiry` in `backend/models.py` (currently 7 days) |
+| Default position select options | The `<Select>` `options` arrays in `Register.tsx` and `Invite.tsx` |

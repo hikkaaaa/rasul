@@ -12,18 +12,13 @@ export function Profile() {
     setSession(loadSession());
   }, []);
 
-  if (session === undefined) return null; // initial render, avoid flash
+  if (session === undefined) return null;
   if (session === null) return <Navigate to="/login" replace />;
 
-  const { user } = session;
+  const { user, permissions } = session;
 
   const handleSignOut = async () => {
-    // Best-effort revoke on the server. We clear local state regardless so
-    // the user is always logged out on this device even if the network call
-    // fails (e.g. offline).
-    try {
-      await logout(session.token);
-    } catch { /* ignore */ }
+    try { await logout(session.token); } catch { /* ignore */ }
     clearSession();
     navigate('/login');
   };
@@ -36,7 +31,7 @@ export function Profile() {
     >
       <div className="bg-cream-100/50 backdrop-blur-2xl border border-white/5 rounded-[32px] p-7 shadow-[0_24px_64px_-12px_rgba(0,0,0,0.4)]">
         <div className="flex items-center gap-4">
-          <div className="w-14 h-14 rounded-2xl bg-gold-400 flex items-center justify-center text-xl font-bold text-ink-900">
+          <div className="w-14 h-14 rounded-2xl bg-gold-500 flex items-center justify-center text-xl font-bold text-ink-900">
             {user.name.charAt(0).toUpperCase()}
           </div>
           <div className="min-w-0 flex-1">
@@ -47,21 +42,33 @@ export function Profile() {
         </div>
       </div>
 
-      <InfoRow label="Full name" value={user.name} />
-      <InfoRow label="Email" value={user.email} />
-      <InfoRow label="IIN" value={user.iin} mono />
+      <InfoRow label="Organization" value={user.organization_name} />
       <InfoRow label="Role" value={user.role} />
+      {user.position && <InfoRow label="Position" value={user.position} />}
+      {user.is_account_owner && (
+        <InfoRow label="Privileges" value="Account Owner — can manage the team" />
+      )}
+      <InfoRow label="IIN" value={user.iin} mono />
 
       <Link
         to="/clients"
-        className="block w-full text-center rounded-2xl bg-gold-400 hover:bg-gold-500 hover:scale-[1.02] active:scale-[0.98] text-ink-900 font-semibold py-4 shadow-md transition-all duration-150"
+        className="block w-full text-center rounded-2xl bg-gold-500 hover:bg-gold-600 hover:scale-[1.02] active:scale-[0.98] text-ink-900 font-semibold py-4 shadow-md transition-all duration-150"
       >
         Open clients dashboard
       </Link>
 
+      {permissions?.['team.manage'] && (
+        <Link
+          to="/team"
+          className="block w-full text-center rounded-2xl bg-cream-100 hover:bg-cream-200/40 border border-cream-200/40 text-ink-900 font-medium py-4 transition-colors"
+        >
+          Manage team
+        </Link>
+      )}
+
       <button
         onClick={handleSignOut}
-        className="w-full rounded-2xl bg-cream-100 hover:bg-cream-200 hover:scale-[1.02] active:scale-[0.98] text-ink-900 font-medium py-4 transition-all duration-150"
+        className="w-full rounded-2xl bg-cream-100 hover:bg-cream-200/40 hover:scale-[1.02] active:scale-[0.98] text-ink-900 font-medium py-4 transition-all duration-150"
       >
         Sign out
       </button>
@@ -80,7 +87,7 @@ function InfoRow({ label, value, mono }: { label: string; value: string; mono?: 
 
 function RoleBadge({ role }: { role: string }) {
   const tone =
-    role === 'Admin' ? 'bg-gold-400 text-ink-900'
+    role === 'Admin' ? 'bg-gold-500 text-ink-900'
     : role === 'Accountant' ? 'bg-cream-200 text-ink-900'
     : 'bg-cream-100 text-ink-500';
   return (
