@@ -629,3 +629,66 @@ To test the invite system end-to-end without a second machine:
 | Liveness pose sequence (number of poses, prompts) | `buildSequence()` in `components/LivenessScanStep.tsx` |
 | Invite expiry window | `_invite_default_expiry` in `backend/models.py` (currently 7 days) |
 | Default position select options | The `<Select>` `options` arrays in `Register.tsx` and `Invite.tsx` |
+
+---
+
+## 1:1 Face Verification
+
+The system has switched from face-only **identification** (1:N nearest-
+neighbor search across every enrolled user) to **1:1 verification**
+(compare the live face only against one specific user's stored vector).
+This accommodates edge cases like identical twins or close lookalikes
+that previously caused login collisions or were rejected at signup.
+
+### What changed
+
+- **Signup** no longer runs a global "is this face already enrolled?"
+  check. The new embedding is saved directly onto the user's record,
+  even if it happens to be very close to another user's vector.
+- **Login** now requires the caller to identify themselves first by
+  email or 12-digit IIN. The backend fetches **only that user's**
+  stored vector and compares the live image against it. There is no
+  longer a database-wide nearest-neighbor scan, so a user with a
+  similar-looking face cannot be accidentally routed into the wrong
+  profile.
+- The `face_vector` column on `users` has no `unique=True` constraint —
+  multiple rows may legitimately hold near-duplicate embeddings.
+
+### New login flow (`/login`)
+
+1. **Step 1 — Identify.** The user types their email or IIN. The
+   frontend slides this card off-screen on submit.
+2. **Step 2 — Scan.** The webcam opens, captures a frame, and posts
+   `{ identifier, image }` to `POST /api/login`. The backend resolves
+   the identifier to one row, computes the live embedding, and runs a
+   single Euclidean distance check against `users.face_vector`.
+3. **Result.** Match within `FACE_TOLERANCE` → token issued and the
+   client lands on `/profile`. Otherwise the response is the uniform
+   message **"Face does not match this account"** — same wording for
+   "no such user", "user has no face enrolled", and "wrong face", so
+   timing/text differences don't leak which identifiers exist.
+
+### Backend `LoginRequest` shape
+
+```jsonc
+POST /api/login
+{
+  "identifier": "ainur@faceid.app",   // email OR 12-digit IIN
+  "image": "data:image/jpeg;base64,…"
+}
+```
+
+The identifier resolution rules:
+- All-digit, length-12 strings are looked up against `users.iin`.
+- Anything else is looked up against `users.email` (case-insensitive,
+  with a verbatim fallback for legacy mixed-case rows).
+
+### What this does NOT change
+
+- The 4-frame liveness check during signup is unchanged.
+- RBAC, organization scoping, invite system, and the AccountOwner
+  capability matrix are unchanged.
+- `FACE_TOLERANCE` (currently 0.5) is still the per-user match threshold;
+  raise/lower it in `backend/.env` to trade off false-rejects vs. false-
+  accepts. There is no longer an "ambiguity margin" — that concept only
+  existed for 1:N search.

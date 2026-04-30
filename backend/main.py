@@ -1,7 +1,6 @@
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
-from math import inf
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
@@ -40,10 +39,6 @@ app.add_middleware(
     allow_headers=["Content-Type", "Authorization"],
 )
 
-
-# Margin between best and second-best match below which a face login is
-# treated as ambiguous and rejected.
-LOGIN_AMBIGUITY_MARGIN = 0.05
 
 # Frontend origin used when minting invite redemption URLs in the response.
 INVITE_LINK_BASE = settings.cors_origins[0] if settings.cors_origins else "http://localhost:5173"
@@ -106,22 +101,6 @@ def _validate_frame_set(frames: list[schemas.FrameCapture]) -> dict[str, face_lo
             raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail=str(exc))
 
     return analyses
-
-
-def _check_duplicate_face(db: Session, vector: list[float], skip_user_id: int | None = None) -> None:
-    """Rejects if `vector` matches a face already enrolled under another
-    user. Optionally skip a specific user (the one being claimed)."""
-    for existing in db.query(models.User).all():
-        if existing.face_vector is None:
-            continue
-        if skip_user_id is not None and existing.id == skip_user_id:
-            continue
-        distance = face_logic.face_distance(existing.face_vector, vector)
-        if distance < settings.duplicate_face_distance:
-            raise HTTPException(
-                status.HTTP_409_CONFLICT,
-                detail="This face is already linked to another account. Please return to the homepage and sign in instead.",
-            )
 
 
 def _find_claimable_user(db: Session, email: str, iin: str) -> models.User | None:
@@ -244,7 +223,11 @@ def register(payload: schemas.RegisterRequest, db: Session = Depends(database.ge
     analyses = _validate_frame_set(payload.frames)
     new_vector = analyses["neutral"].embedding
 
-    _check_duplicate_face(db, new_vector, skip_user_id=claim_target.id if claim_target else None)
+    # Note: we deliberately do NOT run a global "is this face already
+    # enrolled?" check. The system has switched to 1:1 verification, so
+    # collisions (identical twins, lookalikes) are tolerated at signup.
+    # Login disambiguates by requiring the caller to also enter their
+    # email/IIN, then comparing only against that user's stored vector.
 
     pwd_hash = auth.hash_password(payload.password)
 
@@ -299,7 +282,37 @@ def register(payload: schemas.RegisterRequest, db: Session = Depends(database.ge
 
 @app.post("/api/login", response_model=schemas.LoginResponse)
 def login(request: Request, payload: schemas.LoginRequest, db: Session = Depends(database.get_db)):
+    """1:1 face verification.
+
+    Flow:
+      1. Caller submits an `identifier` (email or 12-digit IIN) + a live
+         face image.
+      2. Server fetches THAT user's stored face vector.
+      3. Live embedding is compared to that one vector only — no global
+         search, so identical-twin / lookalike collisions cannot send the
+         caller into the wrong profile.
+
+    The error responses are deliberately uniform ("Face does not match
+    this account") rather than distinguishing "wrong identifier" from
+    "wrong face" — that would let an attacker enumerate registered users
+    via timing or message differences.
+    """
     client_addr = request.client.host if request.client else "unknown"
+
+    identifier = payload.identifier.strip()
+    if not identifier:
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="Enter your email or IIN")
+
+    # Resolve the user. Email is case-insensitive; IIN is the 12-digit form.
+    user: models.User | None
+    if identifier.isdigit() and len(identifier) == 12:
+        user = db.query(models.User).filter(models.User.iin == identifier).first()
+    else:
+        user = db.query(models.User).filter(models.User.email == identifier.lower()).first()
+        if user is None:
+            # Fallback: the user might have signed up with a mixed-case
+            # email; try the verbatim form before giving up.
+            user = db.query(models.User).filter(models.User.email == identifier).first()
 
     try:
         candidate = face_logic.get_embedding(payload.image)
@@ -309,33 +322,23 @@ def login(request: Request, payload: schemas.LoginRequest, db: Session = Depends
     if candidate is None:
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, detail="No single clear face detected in the image")
 
-    best_user: models.User | None = None
-    best_distance = inf
-    second_best_distance = inf
-    for user in db.query(models.User).all():
-        if user.face_vector is None:
-            continue
-        distance = face_logic.face_distance(user.face_vector, candidate)
-        if distance < best_distance:
-            second_best_distance = best_distance
-            best_distance = distance
-            best_user = user
-        elif distance < second_best_distance:
-            second_best_distance = distance
+    # Run the embedding step before the existence check so the response
+    # timing doesn't leak whether the identifier hit a real account.
+    if user is None or user.face_vector is None:
+        logger.warning("login.no_user client=%s identifier=%s", client_addr, identifier)
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Face does not match this account")
 
-    if best_user is None or best_distance > settings.face_tolerance:
-        logger.warning("login.denied client=%s best=%.3f", client_addr, best_distance if best_user else -1)
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Face not recognized")
+    distance = face_logic.face_distance(user.face_vector, candidate)
+    if distance > settings.face_tolerance:
+        logger.warning("login.denied user_id=%d client=%s distance=%.3f", user.id, client_addr, distance)
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Face does not match this account")
 
-    if second_best_distance - best_distance < LOGIN_AMBIGUITY_MARGIN:
-        logger.warning("login.ambiguous client=%s", client_addr)
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, detail="Could not confidently identify you — please try again")
-
-    token = auth.issue_token(db, best_user)
-    logger.info("login.success user_id=%d role=%s org_id=%d", best_user.id, best_user.role.value, best_user.organization_id)
+    token = auth.issue_token(db, user)
+    logger.info("login.success user_id=%d role=%s org_id=%d distance=%.3f",
+                user.id, user.role.value, user.organization_id, distance)
     return schemas.LoginResponse(
         status="authorized",
-        user=schemas.UserPublic(**auth.public_user(best_user)),
+        user=schemas.UserPublic(**auth.public_user(user)),
         token=token,
     )
 

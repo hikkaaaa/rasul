@@ -176,8 +176,14 @@ export function register(input: RegisterInput) {
   return request<RegisterResponse>('/api/register', { body: input });
 }
 
-export function login(image: string) {
-  return request<{ status: string; user: UserProfile; token: string }>('/api/login', { body: { image } });
+export function login(identifier: string, image: string) {
+  // 1:1 verification — backend looks up the user by identifier (email or
+  // 12-digit IIN), then compares the live image only against that user's
+  // stored face vector.
+  return request<{ status: string; user: UserProfile; token: string }>(
+    '/api/login',
+    { body: { identifier, image } },
+  );
 }
 
 export function logout(token: string) {

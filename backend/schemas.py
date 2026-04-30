@@ -78,6 +78,12 @@ class RegisterResponse(BaseModel):
 
 
 class LoginRequest(BaseModel):
+    # 1:1 face verification: caller first identifies themselves by email or
+    # IIN (12 digits). The backend looks up that single user and compares
+    # the live embedding only against their stored vector — no global
+    # nearest-neighbor search, so identical-twin / lookalike collisions
+    # cannot redirect a login to the wrong account.
+    identifier: str = Field(min_length=1, max_length=255)
     image: str = Field(min_length=100, max_length=10_000_000)
 
 
