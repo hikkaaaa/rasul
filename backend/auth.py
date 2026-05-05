@@ -148,7 +148,9 @@ def require_account_owner(user: models.User = Depends(get_current_user)) -> mode
 
 
 def can_modify_clients(role: Role) -> bool:
-    return role == Role.ADMIN
+    # Accountant (Level 2) shares the full client CRUD surface with Admin —
+    # only team-roster management stays admin/owner-only.
+    return role in (Role.ADMIN, Role.ACCOUNTANT)
 
 
 def can_view_credit_card(role: Role) -> bool:

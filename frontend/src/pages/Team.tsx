@@ -9,6 +9,7 @@ import {
   createInvite,
   listInvites,
   listTeam,
+  removeTeamMember,
   revokeInvite,
   type InviteRecord,
   type Role,
@@ -92,6 +93,16 @@ export function Team() {
       await refresh();
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Revoke failed');
+    }
+  };
+
+  const handleRemoveMember = async (m: TeamMember) => {
+    if (!confirm(`Remove ${m.name} from the team? They'll be signed out and lose access immediately.`)) return;
+    try {
+      await removeTeamMember(session.token, m.id);
+      await refresh();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : 'Remove failed');
     }
   };
 
@@ -193,6 +204,14 @@ export function Team() {
                   {m.email} · {m.role}{m.position ? ` · ${m.position}` : ''}
                 </div>
               </div>
+              {!m.is_account_owner && (
+                <button
+                  onClick={() => handleRemoveMember(m)}
+                  className="shrink-0 rounded-xl bg-rose-500/10 hover:bg-rose-500/20 text-rose-300 text-xs font-semibold px-3 py-2 transition-colors"
+                >
+                  Delete
+                </button>
+              )}
             </div>
           ))}
         </div>

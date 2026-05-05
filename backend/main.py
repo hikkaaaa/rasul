@@ -408,6 +408,59 @@ def list_team(user: models.User = Depends(auth.get_current_user), db: Session = 
     ]
 
 
+@app.delete("/api/team/{user_id}", status_code=status.HTTP_204_NO_CONTENT)
+def remove_team_member(
+    user_id: int,
+    user: models.User = Depends(auth.require_account_owner),
+    db: Session = Depends(database.get_db),
+):
+    """Account-owner-only: remove a teammate from the organization.
+
+    The owner can't be removed (they're the org's anchor — transferring
+    ownership isn't part of the current spec). Any active sessions and any
+    pending invites the user created are revoked alongside the user row so
+    no orphan tokens linger.
+    """
+    target = (
+        db.query(models.User)
+        .filter(
+            models.User.id == user_id,
+            models.User.organization_id == user.organization_id,
+        )
+        .first()
+    )
+    if target is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, detail="Team member not found")
+    if target.is_account_owner:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="The account owner cannot be removed")
+    if target.id == user.id:
+        # Defense-in-depth — owner check above already covers this.
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, detail="You cannot remove yourself")
+
+    # Revoke any live sessions so the removed user is signed out immediately.
+    sessions = db.query(models.AuthSession).filter(
+        models.AuthSession.user_id == target.id,
+        models.AuthSession.revoked.is_(False),
+    ).all()
+    for s in sessions:
+        s.revoked = True
+
+    # Revoke any pending invites this user issued (only matters if they had
+    # owner privileges before — currently impossible — but kept for safety).
+    pending = db.query(models.Invite).filter(
+        models.Invite.created_by_user_id == target.id,
+        models.Invite.used_at.is_(None),
+        models.Invite.revoked.is_(False),
+    ).all()
+    for inv in pending:
+        inv.revoked = True
+
+    db.delete(target)
+    db.commit()
+    logger.info("team.remove user_id=%d by_user=%d org_id=%d", user_id, user.id, user.organization_id)
+    return None
+
+
 @app.get("/api/invites", response_model=list[schemas.InviteRead])
 def list_invites(
     user: models.User = Depends(auth.require_account_owner),
@@ -542,6 +595,7 @@ def preview_invite(token: str, db: Session = Depends(database.get_db)):
 
 
 _ALL_READ_ROLES = (Role.ADMIN, Role.ACCOUNTANT, Role.MARKETING)
+_CLIENT_WRITE_ROLES = (Role.ADMIN, Role.ACCOUNTANT)
 
 
 @app.get("/api/clients")
@@ -577,7 +631,7 @@ def get_client(
 @app.post("/api/clients", status_code=status.HTTP_201_CREATED)
 def create_client(
     payload: schemas.ClientCreate,
-    user: models.User = Depends(auth.require_role(Role.ADMIN)),
+    user: models.User = Depends(auth.require_role(*_CLIENT_WRITE_ROLES)),
     db: Session = Depends(database.get_db),
 ):
     client = models.Client(
@@ -598,7 +652,7 @@ def create_client(
 def update_client(
     client_id: int,
     payload: schemas.ClientUpdate,
-    user: models.User = Depends(auth.require_role(Role.ADMIN)),
+    user: models.User = Depends(auth.require_role(*_CLIENT_WRITE_ROLES)),
     db: Session = Depends(database.get_db),
 ):
     client = (
@@ -620,7 +674,7 @@ def update_client(
 @app.delete("/api/clients/{client_id}", status_code=status.HTTP_204_NO_CONTENT)
 def delete_client(
     client_id: int,
-    user: models.User = Depends(auth.require_role(Role.ADMIN)),
+    user: models.User = Depends(auth.require_role(*_CLIENT_WRITE_ROLES)),
     db: Session = Depends(database.get_db),
 ):
     client = (

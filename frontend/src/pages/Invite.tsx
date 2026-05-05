@@ -11,7 +11,6 @@ import {
   previewInvite,
   register,
   type InvitePreview,
-  type Position,
 } from '../lib/api';
 import { saveSession } from '../lib/session';
 
@@ -22,7 +21,6 @@ interface InviteFormValues {
   password: string;
   phone: string;
   iin: string;
-  position: Position;
 }
 
 export function Invite() {
@@ -32,7 +30,7 @@ export function Invite() {
   const [preview, setPreview] = useState<InvitePreview | null | 'error'>(null);
   const [step, setStep] = useState<InviteStep>('preview');
   const [values, setValues] = useState<InviteFormValues>({
-    name: '', password: '', phone: '', iin: '', position: 'Staff',
+    name: '', password: '', phone: '', iin: '',
   });
   const [errors, setErrors] = useState<Partial<Record<keyof InviteFormValues, string>>>({});
   const [submitError, setSubmitError] = useState<string | null>(null);
@@ -88,7 +86,10 @@ export function Invite() {
         company_name: preview.organization_name,
         phone: values.phone,
         iin: values.iin,
-        position: values.position,
+        // Position is set automatically for invitees — the inviting admin
+        // already chose the role, and a job-title field on top of that just
+        // confused users.
+        position: 'Staff',
         frames,
         invite_token: token,
       });
@@ -151,16 +152,6 @@ export function Invite() {
             error={errors.iin}
             inputMode="numeric"
             maxLength={12}
-          />
-          <Select
-            label="Position"
-            value={values.position}
-            onChange={(v) => setValues({ ...values, position: v as Position })}
-            options={[
-              { value: 'Owner', label: 'Owner' },
-              { value: 'Manager', label: 'Manager' },
-              { value: 'Staff', label: 'Staff' },
-            ]}
           />
           <p className="text-xs text-ink-500">
             Your role is locked to <span className="font-semibold text-gold-300">{preview.role}</span> by the invite.
@@ -250,17 +241,3 @@ function Field({ label, value, onChange, error, hint, type = 'text', disabled, .
   );
 }
 
-function Select({ label, value, onChange, options }: { label: string; value: string; onChange: (v: string) => void; options: { value: string; label: string }[] }) {
-  return (
-    <label className="block">
-      <span className="block text-xs font-medium text-ink-500 mb-1.5">{label}</span>
-      <select
-        value={value}
-        onChange={(e) => onChange(e.target.value)}
-        className="w-full rounded-2xl bg-cream-50 border border-cream-200 px-4 py-3 text-ink-900 outline-none focus:border-gold-500 focus:bg-cream-100 transition-colors appearance-none"
-      >
-        {options.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
-      </select>
-    </label>
-  );
-}

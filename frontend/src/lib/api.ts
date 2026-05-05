@@ -237,6 +237,10 @@ export function listTeam(token: string) {
   return request<TeamMember[]>('/api/team', { method: 'GET', token });
 }
 
+export function removeTeamMember(token: string, id: number) {
+  return request<void>(`/api/team/${id}`, { method: 'DELETE', token });
+}
+
 export function listInvites(token: string) {
   return request<InviteRecord[]>('/api/invites', { method: 'GET', token });
 }
